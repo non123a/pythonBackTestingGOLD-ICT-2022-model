@@ -216,12 +216,55 @@ def save_outputs(outdir: str, trades: List[Trade], eq_df: pd.DataFrame, price_df
     # Price candlestick chart
     # plot_candles(price_df, outpath=os.path.join(outdir, "candles.png"))
     plot_candles_plotly(price_df, outpath=os.path.join(outdir, "candles.html"))
+    
+def calculate_trends(df_1m: pd.DataFrame, pivot_k_1h=7, pivot_k_4h=7):
+    """
+    Calculate 1H and 4H trend based on pivot highs/lows.
+    Returns a dict with keys '1h_trend' and '4h_trend' for each datetime in df_1m.
+    """
+    import pandas as pd
+
+    # Resample to 1H and 4H
+    df_1h = df_1m.resample("1H").agg({'Open':'first','High':'max','Low':'min','Close':'last'})
+    df_4h = df_1m.resample("4H").agg({'Open':'first','High':'max','Low':'min','Close':'last'})
+
+    # Pivot detection helper
+    def detect_trend(df, pivot_k):
+        is_ph, is_pl = pivot_highs_lows(df, pivot_k)
+        trend_dict = {}
+        last_trend = None
+        for t in df.index:
+            # Look for last pivot before this bar
+            ph_idx = is_ph.loc[:t]
+            pl_idx = is_pl.loc[:t]
+            if len(ph_idx[ph_idx]) and len(pl_idx[pl_idx]):
+                last_ph = df.loc[ph_idx[ph_idx].index[-1]]['High']
+                last_pl = df.loc[pl_idx[pl_idx].index[-1]]['Low']
+                if df.loc[t,'Close'] > last_ph:
+                    last_trend = "UP"
+                elif df.loc[t,'Close'] < last_pl:
+                    last_trend = "DOWN"
+            trend_dict[t] = last_trend
+        return trend_dict
+
+    trend_1h = detect_trend(df_1h, pivot_k_1h)
+    trend_4h = detect_trend(df_4h, pivot_k_4h)
+
+    # Map back to 1-min index
+    trend_1h_full = df_1m.index.to_series().apply(lambda x: trend_1h[max([k for k in trend_1h if k <= x])])
+    trend_4h_full = df_1m.index.to_series().apply(lambda x: trend_4h[max([k for k in trend_4h if k <= x])])
+
+    return pd.DataFrame({
+        '1h_trend': trend_1h_full,
+        '4h_trend': trend_4h_full
+    })
 
 def backtest_ict_london_bos(
     df: pd.DataFrame,
     london_window,
     ny_window,
     pivot_k: int,
+    trend_df: pd.DataFrame,
     ote_ratio: float = 0.236,
 ):
     """
@@ -241,6 +284,13 @@ def backtest_ict_london_bos(
 
     trades = []
     total_days_triggered = 0
+
+    # Merge trend_df into main df once at the start
+    if "1h_trend" in df.columns:
+        df = df.drop(columns=["1h_trend"])
+    if "4h_trend" in df.columns:
+        df = df.drop(columns=["4h_trend"])
+    df = df.join(trend_df)
 
     for day, day_df in df.groupby(df.index.date):
         day_df = df.loc[str(day)]
@@ -339,6 +389,7 @@ def backtest_ict_london_bos(
                         exit_reason = "close"
                         pnl = 0.0
                         rr_val = 0.0
+
                     trades.append({
                         "day": pd.Timestamp(day),
                         "side": "short",
@@ -355,6 +406,8 @@ def backtest_ict_london_bos(
                         "ote_level": float(bearish_ote_level),
                         "ote_high_used": float(bearish_ote_high),
                         "ote_low_used": float(bearish_ote_low),
+                        "4h_trend": row.get("4h_trend", "NA"),
+                        "1h_trend": row.get("1h_trend", "NA"),
                     })
                     day_had_trade = True
                     bearish_entry_made = True
@@ -406,6 +459,7 @@ def backtest_ict_london_bos(
                         exit_reason = "close"
                         pnl = 0.0
                         rr_val = 0.0
+
                     trades.append({
                         "day": pd.Timestamp(day),
                         "side": "long",
@@ -422,6 +476,8 @@ def backtest_ict_london_bos(
                         "ote_level": float(bullish_ote_level),
                         "ote_low_used": float(bullish_ote_low),
                         "ote_high_used": float(bullish_ote_high),
+                        "4h_trend": row.get("4h_trend", "NA"),
+                        "1h_trend": row.get("1h_trend", "NA"),
                     })
                     day_had_trade = True
                     bullish_entry_made = True
@@ -452,12 +508,14 @@ def backtest_ict_london_bos(
             "pivot_low_BOS","pivot_high_BOS",
             "london_high","london_high_time","london_high_taken_time",
             "london_low","london_low_time","london_low_taken_time",
+            "1h_trend","4h_trend"
         ])
         summary = {
             "trades": 0, "wins": 0, "losses": 0, "closed_no_hit": 0,
             "win_rate_pct": 0.0, "net_pnl_dollars": 0.0, "days_triggered": 0
         }
 
+    # Print trades with 1H and 4H trend
     for _, r in tdf.iterrows():
         print(f"\n{r['day'].date()} [{r['side'].upper()}]")
         print(f"  Entry @ {r['entry_time']}  price={r['entry_price']:.3f}  SL={r['sl']:.3f}  TP={r['tp']:.3f}")
@@ -465,6 +523,7 @@ def backtest_ict_london_bos(
         print(f"  OTE {ote_ratio:.3f} level={r['ote_level']:.3f}  (low used={r.get('ote_low_used', float('nan')):.3f}, high used={r.get('ote_high_used', float('nan')):.3f})")
         print(f"  Exit @ {r['exit_time']}  price={r['exit_price']:.3f}  reason={r['exit_reason']}")
         print(f"  PnL=${r['pnl_dollars']:.2f}  RR={r['rr']:.2f}")
+        print(f"  4h: {r.get('4h_trend', 'NA')}, 1h: {r.get('1h_trend', 'NA')}")
 
     print("\nSummary:", summary)
     return tdf, summary
@@ -477,21 +536,26 @@ def main():
     london_window = parse_window(args.london)
     ny_window = parse_window(args.ny)
     df = load_mt_csv(args.excel, args.tz)
-   
-    trades, summary = backtest_ict_london_bos(df, london_window, ny_window, args.pivot)
+
+    # Resample 1H and 4H from 1-minute df
+    df_1h = df['Close'].resample("1h").ohlc()
+    df_4h = df['Close'].resample("4h").ohlc()
+
+    # Define trend: 1 = bull, -1 = bear
+    df_1h['trend'] = df_1h['close'] - df_1h['open']
+    df_1h['trend'] = df_1h['trend'].apply(lambda x: 1 if x > 0 else -1)
+    df_4h['trend'] = df_4h['close'] - df_4h['open']
+    df_4h['trend'] = df_4h['trend'].apply(lambda x: 1 if x > 0 else -1)
+
+    # Merge into main df
+    trend_df = pd.DataFrame(index=df.index)
+    trend_df['1h_trend'] = df_1h['trend'].reindex(df.index, method='ffill')
+    trend_df['4h_trend'] = df_4h['trend'].reindex(df.index, method='ffill')
+
+    # Call backtest with trend_df
+    trades, summary = backtest_ict_london_bos(df, london_window, ny_window, args.pivot, trend_df)
 
     print("Backtest complete.")
-
-# def main():
-#     args = parse_args()
-#     london_window = parse_window(args.london)
-#     ny_window = parse_window(args.ny)
-#     df = load_mt_csv(args.excel, args.tz)
-   
-#     trades, eq_df =backtest_ict_london_bos(df, london_window, ny_window, args.pivot)
-
-#     save_outputs(args.outdir, trades, eq_df, df)
-#     print("Backtest complete. Outputs written to", os.path.abspath(args.outdir))
 
 if __name__=="__main__":
     main()
