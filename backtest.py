@@ -33,42 +33,6 @@ class Trade:
     exit_price: Optional[float] = None
 
 
-# ---------------------------
-# CLI args
-# ---------------------------
-
-def plot_candles(df, outpath="candles.png"):
-    """
-    df must have Open/High/Low/Close columns, indexed by datetime
-    """
-    fig, ax = plt.subplots(figsize=(12,6))
-    fig.patch.set_facecolor('white')  # white background
-    ax.set_facecolor('white')
-    ax.grid(False)  # remove grid
-
-    width = 0.0005  # bar width in days (adjust for 1-min data)
-    width2 = 0.0001
-
-    for idx, row in df.iterrows():
-        color = 'green' if row['Close'] >= row['Open'] else 'black'
-        # draw the candle body
-        ax.plot([mdates.date2num(idx), mdates.date2num(idx)],
-                [row['Low'], row['High']],
-                color=color, linewidth=1)
-        ax.add_patch(plt.Rectangle((mdates.date2num(idx)-width/2, min(row['Open'], row['Close'])),
-                                   width,
-                                   abs(row['Close']-row['Open']),
-                                   facecolor=color))
-
-    ax.xaxis_date()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    plt.xlabel("Time")
-    plt.ylabel("Price")
-    plt.title("Candlestick Chart")
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
-    plt.close()
-
 def parse_args():
     p = argparse.ArgumentParser("ICT-style London range -> NY OTE 0.77 backtest (1m)")
     p.add_argument("--excel", required=True, help="Path to data file (CSV). MetaTrader format supported.")
@@ -82,9 +46,6 @@ def parse_args():
     p.add_argument("--capital", type=float, default=START_EQUITY)
     return p.parse_args()
 
-# ---------------------------
-# Helpers
-# ---------------------------
 def parse_window(s: str) -> Tuple[pd.Timedelta, pd.Timedelta]:
     """Support hh, hh:mm, hh:mm:ss for session windows"""
     def fix_time(t: str):
@@ -121,13 +82,6 @@ def first_touch_after(window_df: pd.DataFrame, series_df: pd.DataFrame, level: f
     hit = series_df[series_df["High"]>=level] if side=="high" else series_df[series_df["Low"]<=level]
     return hit.index[0] if not hit.empty else None
 
-# ---------------------------
-# Strategy logic (unchanged)
-# ---------------------------
-
-# ---------------------------
-# Output
-# ---------------------------
 def performance_summary(trades: List[Trade], eq: pd.Series) -> dict:
     ret = eq.diff().fillna(0.0)
     sharpe = (ret.mean()/(ret.std(ddof=0)+1e-12))*np.sqrt(252*24*60)
@@ -146,84 +100,19 @@ def performance_summary(trades: List[Trade], eq: pd.Series) -> dict:
         "sharpe_proxy": float(sharpe),
         "max_drawdown_dollars": float(dd),
     }
+   
+import pandas as pd
+from typing import Tuple
 
-# def save_outputs(outdir: str, trades: List[Trade], eq_df: pd.DataFrame, price_df: pd.DataFrame):
-#     os.makedirs(outdir, exist_ok=True)
-#     pd.DataFrame([asdict(t) for t in trades]).to_csv(os.path.join(outdir,"trades.csv"),index=False)
-#     with open(os.path.join(outdir,"summary.json"),"w",encoding="utf-8") as f:
-#         json.dump(performance_summary(trades, eq_df["equity"]),f,indent=2)
-#     eq_df.to_csv(os.path.join(outdir,"equity_curve.csv"))
-#     plt.figure(); price_df["Close"].plot(); plt.title("Price (Close)"); plt.tight_layout(); plt.savefig(os.path.join(outdir,"price.png"),dpi=150); plt.close()
-#     plt.figure(); eq_df["equity"].plot(); plt.title("Equity ($)"); plt.tight_layout(); plt.savefig(os.path.join(outdir,"equity_curve.png"),dpi=150); plt.close()
-import plotly.graph_objects as go
+# NOTE: You must have the pivot_highs_lows and session_slice functions defined elsewhere.
+# from your_other_module import pivot_highs_lows, session_slice
 
-def plot_candles_plotly(df, outpath="candles.html"):
-    fig = go.Figure(data=[go.Candlestick(
-        x=df.index,
-        open=df['Open'],
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close'],
-        increasing_line_color='green',
-        decreasing_line_color='black'
-    )])
-
-    # Layout settings for interactivity
-    fig.update_layout(
-        title="Gold 1-min Candlesticks",
-        xaxis_title="Time",
-        yaxis_title="Price",
-        template="plotly_white",
-        xaxis=dict(
-            rangeslider=dict(visible=True),  # allows zoom horizontally
-            type="date"
-        ),
-        yaxis=dict(fixedrange=False),  # allows vertical zoom
-        dragmode='pan'  # allows panning with mouse
-    )
-
-    fig.write_html(outpath)
-    fig.show()  # optional: open in browser immediately
-    print(f"Interactive chart saved to {outpath}")
-
-def save_outputs(outdir: str, trades: List[Trade], eq_df: pd.DataFrame, price_df: pd.DataFrame):
-    import os
-    os.makedirs(outdir, exist_ok=True)
-
-    # trades.csv
-    # tdf = pd.DataFrame([asdict(t) for t in trades])
-    tdf = pd.DataFrame(trades)
-
-    tdf.to_csv(os.path.join(outdir, "trades.csv"), index=False)
-
-    # summary.json
-    summary = performance_summary(trades, eq_df["equity"])
-    with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    # equity_curve.csv
-    eq_df.to_csv(os.path.join(outdir, "equity_curve.csv"))
-
-    # Equity plot
-    plt.figure()
-    eq_df["equity"].plot()
-    plt.title("Equity ($)")
-    plt.xlabel("Time"); plt.ylabel("Equity ($)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "equity_curve.png"), dpi=150)
-    plt.close()
-
-    # Price candlestick chart
-    # plot_candles(price_df, outpath=os.path.join(outdir, "candles.png"))
-    plot_candles_plotly(price_df, outpath=os.path.join(outdir, "candles.html"))
-    
+# This is the new function you provided
 def calculate_trends(df_1m: pd.DataFrame, pivot_k_1h=7, pivot_k_4h=7):
     """
     Calculate 1H and 4H trend based on pivot highs/lows.
     Returns a dict with keys '1h_trend' and '4h_trend' for each datetime in df_1m.
     """
-    import pandas as pd
-
     # Resample to 1H and 4H
     df_1h = df_1m.resample("1H").agg({'Open':'first','High':'max','Low':'min','Close':'last'})
     df_4h = df_1m.resample("4H").agg({'Open':'first','High':'max','Low':'min','Close':'last'})
@@ -241,37 +130,45 @@ def calculate_trends(df_1m: pd.DataFrame, pivot_k_1h=7, pivot_k_4h=7):
                 last_ph = df.loc[ph_idx[ph_idx].index[-1]]['High']
                 last_pl = df.loc[pl_idx[pl_idx].index[-1]]['Low']
                 if df.loc[t,'Close'] > last_ph:
-                    last_trend = "UP"
+                    last_trend = "Uptrend" # Changed to match original code's labels
                 elif df.loc[t,'Close'] < last_pl:
-                    last_trend = "DOWN"
+                    last_trend = "Downtrend" # Changed to match original code's labels
             trend_dict[t] = last_trend
         return trend_dict
 
-    trend_1h = detect_trend(df_1h, pivot_k_1h)
-    trend_4h = detect_trend(df_4h, pivot_k_4h)
+    trend_1h = detect_trend(df_1h.dropna(), pivot_k_1h)
+    trend_4h = detect_trend(df_4h.dropna(), pivot_k_4h)
 
-    # Map back to 1-min index
-    trend_1h_full = df_1m.index.to_series().apply(lambda x: trend_1h[max([k for k in trend_1h if k <= x])])
-    trend_4h_full = df_1m.index.to_series().apply(lambda x: trend_4h[max([k for k in trend_4h if k <= x])])
+    # Map back to 1-min index using forward-fill
+    trend_1h_full = pd.Series(trend_1h).reindex(df_1m.index, method='ffill')
+    trend_4h_full = pd.Series(trend_4h).reindex(df_1m.index, method='ffill')
 
     return pd.DataFrame({
         '1h_trend': trend_1h_full,
         '4h_trend': trend_4h_full
-    })
+    }).ffill()
+
 
 def backtest_ict_london_bos(
     df: pd.DataFrame,
-    london_window,
-    ny_window,
+    london_window: Tuple[str, str],
+    ny_window: Tuple[str, str],
     pivot_k: int,
-    trend_df: pd.DataFrame,
     ote_ratio: float = 0.236,
 ):
     """
     Backtest ICT London BOS strategy with fixed PnL:
       - Loss = -100
       - Win  = 324
+      Adds 1H / 4H trend (Uptrend / Downtrend).
+      Trade filter:
+        - Only take SHORT if 4H trend = Downtrend
+        - Only take LONG  if 4H trend = Uptrend
     """
+    # =======================================================
+    # NOTE: The pivot logic for BOS and OTE uses 1-min data.
+    # It remains separate from the trend calculation.
+    # =======================================================
     is_ph, is_pl = pivot_highs_lows(df, pivot_k)
 
     def last_pl_before(t):
@@ -282,15 +179,21 @@ def backtest_ict_london_bos(
         idx = is_ph.loc[:t]
         return idx[idx].index[-1] if len(idx[idx]) else None
 
-    trades = []
-    total_days_triggered = 0
+    # =======================================================
+    # NEW: Calculate trends using the improved function
+    # =======================================================
+    # This replaces the old candle-color trend logic
+    trend_df = calculate_trends(df)
 
-    # Merge trend_df into main df once at the start
+    # Merge into df
     if "1h_trend" in df.columns:
         df = df.drop(columns=["1h_trend"])
     if "4h_trend" in df.columns:
         df = df.drop(columns=["4h_trend"])
     df = df.join(trend_df)
+
+    trades = []
+    total_days_triggered = 0
 
     for day, day_df in df.groupby(df.index.date):
         day_df = df.loc[str(day)]
@@ -334,8 +237,29 @@ def backtest_ict_london_bos(
         bullish_entry_made = False
 
         day_had_trade = False
+        
+        # Decide entry timeframe based on precomputed trends
+        # The first row of the NY session will have the trend for that time
+        first_ny_row = ny.iloc[0]
+        initial_4h_trend = first_ny_row.get('4h_trend', 'NA')
+        initial_1h_trend = first_ny_row.get('1h_trend', 'NA')
+        
+        if initial_1h_trend == initial_4h_trend:
+            entry_ny = ny.copy()
+            trade_tf = '1min'
+        else:
+            entry_ny = ny[['Open','High','Low','Close','1h_trend','4h_trend']].resample('5min').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                # Take the trend from the end of the 5-min period
+                '1h_trend': 'last', 
+                '4h_trend': 'last'
+            }).dropna()
+            trade_tf = '5min'
 
-        for t, row in ny.iterrows():
+        for t, row in entry_ny.iterrows():
             # London sweep
             if london_high_taken_time is None and row["High"] > london_high:
                 london_high_taken_time = t
@@ -357,7 +281,7 @@ def backtest_ict_london_bos(
             if bearish_BOS_time is not None and bearish_retrace_time is None and t > bearish_BOS_time:
                 if row["High"] >= pivot_low_BOS:
                     bearish_retrace_time = t
-                    sub = df.loc[bearish_BOS_time:bearish_retrace_time]
+                    sub = entry_ny.loc[bearish_BOS_time:bearish_retrace_time]
                     bearish_low_between = float(sub["Low"].min())
                     bearish_ote_high = float(pivot_high_BOS)
                     bearish_ote_low  = float(bearish_low_between)
@@ -365,11 +289,17 @@ def backtest_ict_london_bos(
 
             if bearish_ote_level is not None and not bearish_entry_made and t > bearish_retrace_time:
                 if row["High"] >= bearish_ote_level:
+                    if (row.get("4h_trend", "NA") != "Downtrend")or(row.get("1h_trend", "NA") != "Downtrend"):
+                    # if (row.get("4h_trend", "NA") != "Downtrend"):
+                        continue
+                  
                     entry_time = t
                     entry_price = float(max(bearish_ote_level, min(row["High"], max(row["Open"], row["Close"]))))
+
                     sl = float(bearish_ote_high)
                     tp = float(bearish_ote_low)
-                    post = ny.loc[ny.index >= entry_time]
+                    post = entry_ny.loc[entry_ny.index >= entry_time]
+
                     exit_time, exit_price, exit_reason = None, None, None
                     pnl, rr_val = 0.0, 0.0
                     for tt, rr in post.iterrows():
@@ -384,8 +314,8 @@ def backtest_ict_london_bos(
                             rr_val = 3.24
                             break
                     if exit_time is None:
-                        exit_time = ny.index[-1]
-                        exit_price = float(ny.iloc[-1]["Close"])
+                        exit_time = entry_ny.index[-1]
+                        exit_price = float(entry_ny.iloc[-1]["Close"])
                         exit_reason = "close"
                         pnl = 0.0
                         rr_val = 0.0
@@ -407,7 +337,8 @@ def backtest_ict_london_bos(
                         "ote_high_used": float(bearish_ote_high),
                         "ote_low_used": float(bearish_ote_low),
                         "4h_trend": row.get("4h_trend", "NA"),
-                        "1h_trend": row.get("1h_trend", "NA"),
+                        "1h_trend": row.get("1h_trend", "NA"), 
+                        "entry_tf": trade_tf,
                     })
                     day_had_trade = True
                     bearish_entry_made = True
@@ -427,7 +358,7 @@ def backtest_ict_london_bos(
             if bullish_BOS_time is not None and bullish_retrace_time is None and t > bullish_BOS_time:
                 if row["Low"] <= pivot_high_BOS:
                     bullish_retrace_time = t
-                    sub = df.loc[bullish_BOS_time:bullish_retrace_time]
+                    sub = entry_ny.loc[bullish_BOS_time:bullish_retrace_time]
                     bullish_high_between = float(sub["High"].max())
                     bullish_ote_low  = float(pivot_low_BOS)
                     bullish_ote_high = float(bullish_high_between)
@@ -435,11 +366,17 @@ def backtest_ict_london_bos(
 
             if bullish_ote_level is not None and not bullish_entry_made and t > bullish_retrace_time:
                 if row["Low"] <= bullish_ote_level:
+                    if (row.get("4h_trend", "NA") != "Uptrend") or (row.get("1h_trend", "NA") != "Uptrend"):
+                    # if (row.get("4h_trend", "NA") != "Uptrend") :
+                        continue
+
                     entry_time = t
                     entry_price = float(min(bullish_ote_level, max(row["Low"], min(row["Open"], row["Close"]))))
+
                     sl = float(bullish_ote_low)
                     tp = float(bullish_ote_high)
-                    post = ny.loc[ny.index >= entry_time]
+                    post = entry_ny.loc[entry_ny.index >= entry_time]
+
                     exit_time, exit_price, exit_reason = None, None, None
                     pnl, rr_val = 0.0, 0.0
                     for tt, rr in post.iterrows():
@@ -454,8 +391,8 @@ def backtest_ict_london_bos(
                             rr_val = 3.24
                             break
                     if exit_time is None:
-                        exit_time = ny.index[-1]
-                        exit_price = float(ny.iloc[-1]["Close"])
+                        exit_time = entry_ny.index[-1]
+                        exit_price = float(entry_ny.iloc[-1]["Close"])
                         exit_reason = "close"
                         pnl = 0.0
                         rr_val = 0.0
@@ -478,6 +415,7 @@ def backtest_ict_london_bos(
                         "ote_high_used": float(bullish_ote_high),
                         "4h_trend": row.get("4h_trend", "NA"),
                         "1h_trend": row.get("1h_trend", "NA"),
+                        "entry_tf": trade_tf,
                     })
                     day_had_trade = True
                     bullish_entry_made = True
@@ -485,6 +423,9 @@ def backtest_ict_london_bos(
         if day_had_trade:
             total_days_triggered += 1
 
+    # =====================
+    # Results + Summary
+    # =====================
     if trades:
         tdf = pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
         wins = int((tdf["exit_reason"] == "tp").sum())
@@ -515,7 +456,6 @@ def backtest_ict_london_bos(
             "win_rate_pct": 0.0, "net_pnl_dollars": 0.0, "days_triggered": 0
         }
 
-    # Print trades with 1H and 4H trend
     for _, r in tdf.iterrows():
         print(f"\n{r['day'].date()} [{r['side'].upper()}]")
         print(f"  Entry @ {r['entry_time']}  price={r['entry_price']:.3f}  SL={r['sl']:.3f}  TP={r['tp']:.3f}")
@@ -524,10 +464,10 @@ def backtest_ict_london_bos(
         print(f"  Exit @ {r['exit_time']}  price={r['exit_price']:.3f}  reason={r['exit_reason']}")
         print(f"  PnL=${r['pnl_dollars']:.2f}  RR={r['rr']:.2f}")
         print(f"  4h: {r.get('4h_trend', 'NA')}, 1h: {r.get('1h_trend', 'NA')}")
+        print(f"  TF: {r.get('entry_tf', 'NA')}")
 
     print("\nSummary:", summary)
     return tdf, summary
-
 # ---------------------------
 # Main
 # ---------------------------
@@ -537,25 +477,10 @@ def main():
     ny_window = parse_window(args.ny)
     df = load_mt_csv(args.excel, args.tz)
 
-    # Resample 1H and 4H from 1-minute df
-    df_1h = df['Close'].resample("1h").ohlc()
-    df_4h = df['Close'].resample("4h").ohlc()
-
-    # Define trend: 1 = bull, -1 = bear
-    df_1h['trend'] = df_1h['close'] - df_1h['open']
-    df_1h['trend'] = df_1h['trend'].apply(lambda x: 1 if x > 0 else -1)
-    df_4h['trend'] = df_4h['close'] - df_4h['open']
-    df_4h['trend'] = df_4h['trend'].apply(lambda x: 1 if x > 0 else -1)
-
-    # Merge into main df
-    trend_df = pd.DataFrame(index=df.index)
-    trend_df['1h_trend'] = df_1h['trend'].reindex(df.index, method='ffill')
-    trend_df['4h_trend'] = df_4h['trend'].reindex(df.index, method='ffill')
-
-    # Call backtest with trend_df
-    trades, summary = backtest_ict_london_bos(df, london_window, ny_window, args.pivot, trend_df)
+    trades, summary = backtest_ict_london_bos(df, london_window, ny_window, args.pivot)
 
     print("Backtest complete.")
+
 
 if __name__=="__main__":
     main()
