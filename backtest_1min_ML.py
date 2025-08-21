@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 import argparse, os, json
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple
@@ -15,23 +16,7 @@ import optuna
 DEFAULT_TZ = "America/New_York"
 LONDON_START, LONDON_END = "03:00", "07:00"
 NY_START, NY_END = "07:00", "12:00"
-PIVOT_K = 7
-OTE_LEVEL = 0.77
 RISK_PER_TRADE = 100.0
-START_EQUITY = 10_000.0
-
-@dataclass
-class Trade:
-    date: pd.Timestamp
-    direction: str
-    entry: float
-    stop: float
-    target: float
-    risk: float
-    reward: float
-    result: str = ""
-    exit_date: Optional[pd.Timestamp] = None
-    exit_price: Optional[float] = None
 
 def parse_args():
     p = argparse.ArgumentParser("ICT-style London range -> NY OTE backtest (1m)")
@@ -40,10 +25,7 @@ def parse_args():
     p.add_argument("--outdir", default="./out", help="Where to write results")
     p.add_argument("--london", default=f"{LONDON_START}-{LONDON_END}", help="London window HH:MM-HH:MM")
     p.add_argument("--ny", default=f"{NY_START}-{NY_END}", help="NY window HH:MM-HH:MM")
-    p.add_argument("--pivot", type=int, default=PIVOT_K)
-    p.add_argument("--ote", type=float, default=OTE_LEVEL)
     p.add_argument("--risk", type=float, default=RISK_PER_TRADE)
-    p.add_argument("--capital", type=float, default=START_EQUITY)
     return p.parse_args()
 
 def parse_window(s: str) -> Tuple[pd.Timedelta, pd.Timedelta]:
@@ -76,29 +58,7 @@ def session_slice(day_df: pd.DataFrame, start: pd.Timedelta, end: pd.Timedelta) 
     s, e = d0 + start, d0 + end
     return day_df.loc[(day_df.index>=s) & (day_df.index<=e)]
 
-def performance_summary(trades: List[dict]) -> dict:
-    if not trades:
-        return {
-            "trades": 0, "wins": 0, "losses": 0, "closed_no_hit": 0,
-            "win_rate_pct": 0.0, "net_pnl_dollars": 0.0, "days_triggered": 0
-        }
-    
-    tdf = pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
-    
-    wins = (tdf["pnl_dollars"] > 0).sum()
-    losses = (tdf["pnl_dollars"] <= 0).sum()
-    
-    summary = {
-        "trades": len(tdf),
-        "wins": int(wins),
-        "losses": int(losses),
-        "win_rate_pct": 100.0 * wins / max(1, wins + losses),
-        "net_pnl_dollars": float(tdf["pnl_dollars"].sum())
-    }
-    return summary
-
 def calculate_trends(df_1m: pd.DataFrame, pivot_k_1h=7, pivot_k_4h=7):
-    # Resample to 1H and 4H
     df_1h = df_1m.resample("1h").agg({'Open':'first','High':'max','Low':'min','Close':'last'})
     df_4h = df_1m.resample("4h").agg({'Open':'first','High':'max','Low':'min','Close':'last'})
 
@@ -135,7 +95,7 @@ def is_valid_trend(row, tf_filter):
     trend_1h = row.get("1h_trend")
     
     if tf_filter == "none":
-        return True, True  # Bullish and Bearish are both allowed
+        return True, True
     elif tf_filter == "1h":
         return trend_1h == "Uptrend", trend_1h == "Downtrend"
     elif tf_filter == "4h":
@@ -146,11 +106,13 @@ def is_valid_trend(row, tf_filter):
     return False, False
 
 def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mult, ote, tf_filter, risk_per_trade):
+    ote_ratio = 1.0 - ote
     is_ph, is_pl = pivot_highs_lows(df, pivot)
 
     def last_pl_before(t):
         idx = is_pl.loc[:t]
         return idx[idx].index[-1] if len(idx[idx]) else None
+
     def last_ph_before(t):
         idx = is_ph.loc[:t]
         return idx[idx].index[-1] if len(idx[idx]) else None
@@ -159,6 +121,8 @@ def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mul
     df = df.join(trend_df)
     
     trades = []
+    flash_trades = 0
+    total_days_triggered = 0
 
     for day, day_df in df.groupby(df.index.date):
         day_df = df.loc[str(day)]
@@ -168,8 +132,6 @@ def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mul
         if lon.empty: continue
         london_high = float(lon["High"].max())
         london_low  = float(lon["Low"].min())
-        london_high_time = lon["High"].idxmax()
-        london_low_time  = lon["Low"].idxmin()
 
         ny = session_slice(day_df, *ny_window)
         if ny.empty: continue
@@ -186,7 +148,10 @@ def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mul
         bullish_ote_level = None
         bullish_entry_made = False
 
-        for t, row in ny.iterrows():
+        day_had_trade = False
+        entry_ny = ny.copy()
+
+        for t, row in entry_ny.iterrows():
             if london_high_taken_time is None and row["High"] > london_high:
                 london_high_taken_time = t
             if london_low_taken_time is None and row["Low"] < london_low:
@@ -197,47 +162,74 @@ def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mul
                 pl_t = last_pl_before(t)
                 ph_t = last_ph_before(t)
                 if pl_t and ph_t:
-                    b_lvl = float(df.loc[pl_t, "Low"])
-                    if row["Close"] < b_lvl:
+                    pivot_low_BOS = float(df.loc[pl_t, "Low"])
+                    if row["Close"] < pivot_low_BOS:
                         bearish_BOS_time = t
-            
-            if bearish_BOS_time is not None and bearish_retrace_time is None and t > bearish_BOS_time:
-                ph_t = last_ph_before(t)
-                if ph_t:
-                    h_lvl = float(df.loc[ph_t, "High"])
-                    if row["High"] >= h_lvl:
-                        bearish_retrace_time = t
-                        sub = ny.loc[bearish_BOS_time:bearish_retrace_time]
-                        bearish_low_between = float(sub["Low"].min())
-                        bearish_ote_high = float(h_lvl)
-                        bearish_ote_low  = float(bearish_low_between)
-                        bearish_ote_level = bearish_ote_high - (bearish_ote_high - bearish_ote_low) * ote
+                        pivot_high_BOS = float(df.loc[ph_t, "High"])
 
-            if bearish_ote_level is not None and not bearish_entry_made and t > bearish_retrace_time:
+            if bearish_BOS_time is not None and bearish_retrace_time is None and t > bearish_BOS_time:
+                if pivot_high_BOS is not None:
+                    retrace_candles = entry_ny.loc[bearish_BOS_time:t]
+                    lowest_retrace_low = float(retrace_candles["Low"].min())
+                    bearish_ote_level = pivot_high_BOS - (pivot_high_BOS - lowest_retrace_low) * ote_ratio
+                    if row["High"] >= bearish_ote_level:
+                        bearish_retrace_time = t
+
+            if bearish_ote_level is not None and not bearish_entry_made and bearish_retrace_time is not None and t > bearish_retrace_time:
                 is_bullish, is_bearish = is_valid_trend(row, tf_filter)
                 if row["High"] >= bearish_ote_level and is_bearish:
                     entry_time = t
                     entry_price = float(max(bearish_ote_level, min(row["High"], max(row["Open"], row["Close"]))))
 
-                    # --- NEW LOGIC for SL/TP ---
-                    risk_in_price = abs(entry_price - bearish_ote_high)
+                    raw_sl_price = pivot_high_BOS
+                    risk_in_price = abs(entry_price - raw_sl_price)
                     sl = entry_price + (risk_in_price * sl_mult)
                     tp = entry_price - (risk_in_price * tp_mult)
                     
-                    post = ny.loc[ny.index >= entry_time]
-                    pnl_dollars = 0.0
+                    if abs(sl - entry_price) > 0:
+                        trade_size = risk_per_trade / abs(sl - entry_price)
+                    else:
+                        trade_size = 0
+                    
+                    exit_time, exit_price, exit_reason = None, None, None
+                    pnl_dollars, rr_val = 0.0, 0.0
+                    post = entry_ny.loc[entry_ny.index >= entry_time]
+                    
                     for tt, rr in post.iterrows():
                         if rr["High"] >= sl:
-                            pnl_dollars = -risk_per_trade
+                            exit_time, exit_price, exit_reason = tt, sl, "sl"
+                            pnl_dollars = (entry_price - sl) * trade_size
+                            rr_val = pnl_dollars / risk_per_trade if risk_per_trade > 0 else 0
                             break
                         if rr["Low"] <= tp:
-                            pnl_dollars = tp_mult * risk_per_trade
+                            exit_time, exit_price, exit_reason = tt, tp, "tp"
+                            pnl_dollars = (entry_price - tp) * trade_size
+                            rr_val = pnl_dollars / risk_per_trade if risk_per_trade > 0 else 0
                             break
                     
+                    if exit_time is None:
+                        exit_time = entry_ny.index[-1]
+                        exit_price = float(entry_ny.iloc[-1]["Close"])
+                        exit_reason = "close"
+                        pnl_dollars = (entry_price - exit_price) * trade_size
+                        rr_val = 0.0
+                    
+                    if exit_time == entry_time:
+                        flash_trades += 1
+                        
                     trades.append({
-                        "entry_time": entry_time,
-                        "pnl_dollars": pnl_dollars
+                        "day": pd.Timestamp(day),
+                        "side": "short",
+                        "entry_time": entry_time, "entry_price": entry_price,
+                        "sl": sl, "tp": tp,
+                        "exit_time": exit_time, "exit_price": exit_price, "exit_reason": exit_reason,
+                        "pnl_dollars": pnl_dollars, "rr": rr_val,
+                        "ote_high_used": float(pivot_high_BOS),
+                        "ote_low_used": lowest_retrace_low,
+                        "4h_trend": row.get("4h_trend", "NA"),
+                        "1h_trend": row.get("1h_trend", "NA"),
                     })
+                    day_had_trade = True
                     bearish_entry_made = True
 
             # --- Bullish ---
@@ -245,51 +237,125 @@ def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mul
                 ph_t = last_ph_before(t)
                 pl_t = last_pl_before(t)
                 if ph_t and pl_t:
-                    b_lvl = float(df.loc[ph_t, "High"])
-                    if row["Close"] > b_lvl:
+                    pivot_high_BOS = float(df.loc[ph_t, "High"])
+                    if row["Close"] > pivot_high_BOS:
                         bullish_BOS_time = t
-
-            if bullish_BOS_time is not None and bullish_retrace_time is None and t > bullish_BOS_time:
-                pl_t = last_pl_before(t)
-                if pl_t:
-                    l_lvl = float(df.loc[pl_t, "Low"])
-                    if row["Low"] <= l_lvl:
-                        bullish_retrace_time = t
-                        sub = ny.loc[bullish_BOS_time:bullish_retrace_time]
-                        bullish_high_between = float(sub["High"].max())
-                        bullish_ote_low  = float(l_lvl)
-                        bullish_ote_high = float(bullish_high_between)
-                        bullish_ote_level = bullish_ote_low + (bullish_ote_high - bullish_ote_low) * ote
+                        pivot_low_BOS = float(df.loc[pl_t, "Low"])
             
-            if bullish_ote_level is not None and not bullish_entry_made and t > bullish_retrace_time:
+            if bullish_BOS_time is not None and bullish_retrace_time is None and t > bullish_BOS_time:
+                if pivot_low_BOS is not None:
+                    retrace_candles = entry_ny.loc[bullish_BOS_time:t]
+                    highest_retrace_high = float(retrace_candles["High"].max())
+                    bullish_ote_level = pivot_low_BOS + (highest_retrace_high - pivot_low_BOS) * ote_ratio
+                    if row["Low"] <= bullish_ote_level:
+                        bullish_retrace_time = t
+            
+            if bullish_ote_level is not None and not bullish_entry_made and bullish_retrace_time is not None and t > bullish_retrace_time:
                 is_bullish, is_bearish = is_valid_trend(row, tf_filter)
                 if row["Low"] <= bullish_ote_level and is_bullish:
                     entry_time = t
                     entry_price = float(min(bullish_ote_level, max(row["Low"], min(row["Open"], row["Close"]))))
 
-                    # --- NEW LOGIC for SL/TP ---
-                    risk_in_price = abs(entry_price - bullish_ote_low)
+                    raw_sl_price = pivot_low_BOS
+                    risk_in_price = abs(entry_price - raw_sl_price)
                     sl = entry_price - (risk_in_price * sl_mult)
                     tp = entry_price + (risk_in_price * tp_mult)
+                    
+                    if abs(sl - entry_price) > 0:
+                        trade_size = risk_per_trade / abs(sl - entry_price)
+                    else:
+                        trade_size = 0
+                    
+                    exit_time, exit_price, exit_reason = None, None, None
+                    pnl_dollars, rr_val = 0.0, 0.0
+                    post = entry_ny.loc[entry_ny.index >= entry_time]
 
-                    post = ny.loc[ny.index >= entry_time]
-                    pnl_dollars = 0.0
                     for tt, rr in post.iterrows():
                         if rr["Low"] <= sl:
-                            pnl_dollars = -risk_per_trade
+                            exit_time, exit_price, exit_reason = tt, sl, "sl"
+                            pnl_dollars = (sl - entry_price) * trade_size
+                            rr_val = pnl_dollars / risk_per_trade if risk_per_trade > 0 else 0
                             break
                         if rr["High"] >= tp:
-                            pnl_dollars = tp_mult * risk_per_trade
+                            exit_time, exit_price, exit_reason = tt, tp, "tp"
+                            pnl_dollars = (tp - entry_price) * trade_size
+                            rr_val = pnl_dollars / risk_per_trade if risk_per_trade > 0 else 0
                             break
+                    
+                    if exit_time is None:
+                        exit_time = entry_ny.index[-1]
+                        exit_price = float(entry_ny.iloc[-1]["Close"])
+                        exit_reason = "close"
+                        pnl_dollars = (exit_price - entry_price) * trade_size
+                        rr_val = 0.0
+                    
+                    if exit_time == entry_time:
+                        flash_trades += 1
 
                     trades.append({
-                        "entry_time": entry_time,
-                        "pnl_dollars": pnl_dollars
+                        "day": pd.Timestamp(day),
+                        "side": "long",
+                        "entry_time": entry_time, "entry_price": entry_price,
+                        "sl": sl, "tp": tp,
+                        "exit_time": exit_time, "exit_price": exit_price, "exit_reason": exit_reason,
+                        "pnl_dollars": pnl_dollars, "rr": rr_val,
+                        "ote_low_used": float(pivot_low_BOS),
+                        "ote_high_used": highest_retrace_high,
+                        "4h_trend": row.get("4h_trend", "NA"),
+                        "1h_trend": row.get("1h_trend", "NA"),
                     })
+                    day_had_trade = True
                     bullish_entry_made = True
-    
-    return trades, performance_summary(trades)
+        
+        if day_had_trade:
+            total_days_triggered += 1
 
+    if trades:
+        tdf = pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
+        wins = int((tdf["exit_reason"] == "tp").sum())
+        losses = int((tdf["exit_reason"] == "sl").sum())
+        closes = int((tdf["exit_reason"] == "close").sum())
+        wr = 100.0 * wins / max(1, wins + losses)
+        summary = {
+            "trades": len(tdf),
+            "wins": wins,
+            "losses": losses,
+            "closed_no_hit": closes,
+            "win_rate_pct": wr,
+            "net_pnl_dollars": float(tdf["pnl_dollars"].sum()),
+            "days_triggered": total_days_triggered,
+            "flash_trades": flash_trades,
+        }
+    else:
+        tdf = pd.DataFrame()
+        summary = {
+            "trades": 0, "wins": 0, "losses": 0, "closed_no_hit": 0,
+            "win_rate_pct": 0.0, "net_pnl_dollars": 0.0, "days_triggered": 0,
+            "flash_trades": flash_trades
+        }
+    
+    return tdf, summary
+
+def objective(trial, df_train, london_window, ny_window, risk_per_trade):
+    params = {
+        "pivot": trial.suggest_int("pivot", 3, 20, step=2),
+        "sl_mult": trial.suggest_float("sl_mult", 0.5, 3.0),
+        "tp_mult": trial.suggest_float("tp_mult", 0.5, 5.0),
+        "ote": trial.suggest_float("ote", 0.6, 0.8),
+        "tf_filter": trial.suggest_categorical("tf_filter", ["none", "1h", "4h", "1h+4h"]),
+    }
+    
+    trades_df, summary = backtest_ict_london_bos(
+        df_train,
+        london_window=london_window,
+        ny_window=ny_window,
+        **params,
+        risk_per_trade=risk_per_trade
+    )
+    
+    # --- Add penalty for flash trades ---
+    penalty = summary["flash_trades"] * 1000  # $1000 penalty per flash trade
+    return summary["net_pnl_dollars"] - penalty
 
 def main():
     print("Starting...")
@@ -302,25 +368,8 @@ def main():
     df_train = df.iloc[:split_idx]
     df_test = df.iloc[split_idx:]
 
-    def objective(trial):
-        params = {
-            "pivot": trial.suggest_int("pivot", 3, 20, step=2),
-            "sl_mult": trial.suggest_float("sl_mult", 0.5, 3.0),
-            "tp_mult": trial.suggest_float("tp_mult", 0.5, 5.0),
-            "ote": trial.suggest_float("ote", 0.6, 0.8),
-            "tf_filter": trial.suggest_categorical("tf_filter", ["none", "1h", "4h", "1h+4h"]),
-        }
-        trades, summary = backtest_ict_london_bos(
-            df_train,
-            london_window=london_window,
-            ny_window=ny_window,
-            **params,
-            risk_per_trade=RISK_PER_TRADE
-        )
-        return summary["net_pnl_dollars"]
-
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=200)
+    study.optimize(lambda trial: objective(trial, df_train, london_window, ny_window, args.risk), n_trials=200)
 
     print("\n✅ Best parameters (train):", study.best_params)
     print("📈 Best train score:", study.best_value)
@@ -329,8 +378,6 @@ def main():
     print("\nRe-running top 3 trials to get detailed backtest results...")
     
     trials_df = study.trials_dataframe().sort_values("value", ascending=False).head(3)
-    
-    top_results = []
     
     for index, row in trials_df.iterrows():
         trial_params = {
@@ -341,46 +388,40 @@ def main():
             "tf_filter": row["params_tf_filter"],
         }
         
-        trades, summary = backtest_ict_london_bos(
+        trades_df, summary = backtest_ict_london_bos(
             df_train,
             london_window=london_window,
             ny_window=ny_window,
             **trial_params,
-            risk_per_trade=RISK_PER_TRADE
+            risk_per_trade=args.risk
         )
         
-        top_results.append({
-            "rank": len(top_results) + 1,
-            "net_profit": summary["net_pnl_dollars"],
-            "win_rate_percent": summary["win_rate_pct"],
-            "total_trades": summary["trades"],
-            "pivot": trial_params["pivot"],
-            "sl_mult": trial_params["sl_mult"],
-            "tp_mult": trial_params["tp_mult"],
-            "ote": trial_params["ote"],
-            "tf_filter": trial_params["tf_filter"]
-        })
-        
-    top_results_df = pd.DataFrame(top_results)
-    
-    output_path = "top_3_detailed_results.csv"
-    top_results_df.to_csv(output_path, index=False)
-    
-    print(f"✅ Top 3 detailed results saved to {output_path}")
-    print("\nTop 3 results:")
-    print(top_results_df)
+        print(f"\n--- Top {index + 1} Result ---")
+        print(f"Parameters: {trial_params}")
+        if not trades_df.empty:
+            for _, r in trades_df.iterrows():
+                print(f"\n{r['day'].date()} [{r['side'].upper()}]")
+                print(f"  Entry @ {r['entry_time']}  price={r['entry_price']:.3f}")
+                print(f"  Final SL/TP: {r['sl']:.3f} | {r['tp']:.3f}")
+                print(f"  Exit @ {r['exit_time']}  price={r['exit_price']:.3f}  reason={r['exit_reason']}")
+                print(f"  PnL=${r['pnl_dollars']:.2f}  RR={r['rr']:.2f}")
+                print(f"  4h: {r.get('4h_trend', 'NA')}, 1h: {r.get('1h_trend', 'NA')}")
+        else:
+            print("No trades were taken with these parameters.")
+
+        print("\nSummary:", summary)
 
     # --- Final evaluation on unseen test data ---
     print("\nEvaluating on unseen test data with best parameters...")
-    trades_test, summary_test = backtest_ict_london_bos(
+    trades_test_df, summary_test = backtest_ict_london_bos(
         df_test,
         london_window=london_window,
         ny_window=ny_window,
         **study.best_params,
-        risk_per_trade=RISK_PER_TRADE
+        risk_per_trade=args.risk
     )
-
-    print("\n📊 Test performance:", summary_test["net_pnl_dollars"])
+    
+    print("\n📊 Test performance:", summary_test)
     print("Backtest complete.")
 
 if __name__=="__main__":
