@@ -14,7 +14,7 @@ import matplotlib.dates as mdates
 DEFAULT_TZ = "America/New_York"
 LONDON_START, LONDON_END = "03:00", "07:00"
 NY_START, NY_END = "07:00", "12:00"
-PIVOT_K = 9
+PIVOT_K = 7
 OTE_LEVEL = 0.77
 RISK_PER_TRADE = 100.0
 START_EQUITY = 10_000.0
@@ -157,18 +157,22 @@ def backtest_ict_london_bos(
     ote_ratio: float = 0.236,
 ):
     """
-    Backtest ICT London BOS strategy with fixed PnL:
+    Backtest ICT London BOS strategy with fixed PnL (5-min timeframe).
       - Loss = -100
       - Win  = 324
-      Adds 1H / 4H trend (Uptrend / Downtrend).
-      Trade filter:
-        - Only take SHORT if 4H trend = Downtrend
-        - Only take LONG  if 4H trend = Uptrend
     """
     # =======================================================
-    # NOTE: The pivot logic for BOS and OTE uses 1-min data.
-    # It remains separate from the trend calculation.
+    # STEP 1: RESAMPLE ALL DATA TO 5 MINUTES
     # =======================================================
+    df_5m = df.resample("5min").agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last'
+    }).dropna()
+
+    df = df_5m.copy()
+
     is_ph, is_pl = pivot_highs_lows(df, pivot_k)
 
     def last_pl_before(t):
@@ -179,13 +183,8 @@ def backtest_ict_london_bos(
         idx = is_ph.loc[:t]
         return idx[idx].index[-1] if len(idx[idx]) else None
 
-    # =======================================================
-    # NEW: Calculate trends using the improved function
-    # =======================================================
-    # This replaces the old candle-color trend logic
-    trend_df = calculate_trends(df)
-
-    # Merge into df
+    trend_df = calculate_trends(df, pivot_k_1h=pivot_k, pivot_k_4h=pivot_k)
+    
     if "1h_trend" in df.columns:
         df = df.drop(columns=["1h_trend"])
     if "4h_trend" in df.columns:
@@ -196,24 +195,14 @@ def backtest_ict_london_bos(
     total_days_triggered = 0
 
     for day, day_df in df.groupby(df.index.date):
-        day_df = df.loc[str(day)]
-        if day_df.empty:
-            continue
-
-        lon = session_slice(day_df, *london_window)
-        if lon.empty:
-            continue
-        london_high = float(lon["High"].max())
-        london_low  = float(lon["Low"].min())
-        london_high_time = lon["High"].idxmax()
-        london_low_time  = lon["Low"].idxmin()
-
-        ny = session_slice(day_df, *ny_window)
-        if ny.empty:
-            continue
-
-        # Bearish variables
+        
+        # --- FIX: Initialize ALL variables at the start of the loop ---
+        london_high = None
+        london_low = None
+        london_high_time = None
+        london_low_time = None
         london_high_taken_time = None
+        london_low_taken_time = None
         bearish_BOS_time = None
         pivot_high_BOS = None
         pivot_low_BOS  = None
@@ -223,50 +212,45 @@ def backtest_ict_london_bos(
         bearish_ote_low  = None
         bearish_ote_level = None
         bearish_entry_made = False
-
-        # Bullish variables
-        london_low_taken_time = None
         bullish_BOS_time = None
-        pivot_low_BOS  = None
-        pivot_high_BOS = None
         bullish_retrace_time = None
         bullish_high_between = None
         bullish_ote_low  = None
         bullish_ote_high = None
         bullish_ote_level = None
         bullish_entry_made = False
-
         day_had_trade = False
+        # --- End of Fix ---
+
+        day_df = df.loc[str(day)]
+        if day_df.empty:
+            continue
+
+        lon = session_slice(day_df, *london_window)
+        if lon.empty:
+            continue
         
-        # Decide entry timeframe based on precomputed trends
-        # The first row of the NY session will have the trend for that time
-        first_ny_row = ny.iloc[0]
-        initial_4h_trend = first_ny_row.get('4h_trend', 'NA')
-        initial_1h_trend = first_ny_row.get('1h_trend', 'NA')
-        
-        if initial_1h_trend == initial_4h_trend:
-            entry_ny = ny.copy()
-            trade_tf = '1min'
-        else:
-            entry_ny = ny[['Open','High','Low','Close','1h_trend','4h_trend']].resample('5min').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                # Take the trend from the end of the 5-min period
-                '1h_trend': 'last', 
-                '4h_trend': 'last'
-            }).dropna()
-            trade_tf = '5min'
+        london_high = float(lon["High"].max())
+        london_low  = float(lon["Low"].min())
+        london_high_time = lon["High"].idxmax()
+        london_low_time  = lon["Low"].idxmin()
+
+        ny = session_slice(day_df, *ny_window)
+        if ny.empty:
+            continue
+
+        entry_ny = ny.copy()
+        trade_tf = '5min'
 
         for t, row in entry_ny.iterrows():
-            # London sweep
+            # The rest of your trading logic here...
+            # This loop can now safely reference the variables because they are guaranteed to exist.
             if london_high_taken_time is None and row["High"] > london_high:
                 london_high_taken_time = t
             if london_low_taken_time is None and row["Low"] < london_low:
                 london_low_taken_time = t
 
-            # ---------------- Bearish ----------------
+            # ... (the rest of your logic)
             if london_high_taken_time is not None and bearish_BOS_time is None:
                 pl_t = last_pl_before(t)
                 ph_t = last_ph_before(t)
@@ -289,8 +273,7 @@ def backtest_ict_london_bos(
 
             if bearish_ote_level is not None and not bearish_entry_made and t > bearish_retrace_time:
                 if row["High"] >= bearish_ote_level:
-                    if (row.get("4h_trend", "NA") != "Downtrend")or(row.get("1h_trend", "NA") != "Downtrend"):
-                    # if (row.get("4h_trend", "NA") != "Downtrend"):
+                    if (row.get("4h_trend", "NA") != "Downtrend") or (row.get("1h_trend", "NA") != "Uptrend"):
                         continue
                   
                     entry_time = t
@@ -342,7 +325,7 @@ def backtest_ict_london_bos(
                     })
                     day_had_trade = True
                     bearish_entry_made = True
-
+            
             # ---------------- Bullish ----------------
             if london_low_taken_time is not None and bullish_BOS_time is None:
                 ph_t = last_ph_before(t)
@@ -366,8 +349,7 @@ def backtest_ict_london_bos(
 
             if bullish_ote_level is not None and not bullish_entry_made and t > bullish_retrace_time:
                 if row["Low"] <= bullish_ote_level:
-                    if (row.get("4h_trend", "NA") != "Uptrend") or (row.get("1h_trend", "NA") != "Uptrend"):
-                    # if (row.get("4h_trend", "NA") != "Uptrend") :
+                    if (row.get("4h_trend", "NA") != "Uptrend") or (row.get("1h_trend", "NA") != "Downtrend"):
                         continue
 
                     entry_time = t
@@ -426,6 +408,7 @@ def backtest_ict_london_bos(
     # =====================
     # Results + Summary
     # =====================
+    # ... (rest of the function is unchanged)
     if trades:
         tdf = pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
         wins = int((tdf["exit_reason"] == "tp").sum())
@@ -468,8 +451,6 @@ def backtest_ict_london_bos(
 
     print("\nSummary:", summary)
     return tdf, summary
-# ---------------------------
-# Main
 # ---------------------------
 def main():
     args = parse_args()
