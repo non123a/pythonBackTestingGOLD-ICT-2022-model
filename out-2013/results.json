@@ -1,0 +1,29 @@
+{
+    "best_parameters": {
+        "pivot": 15,
+        "sl_mult": 2.034067024863787,
+        "tp_mult": 4.7437373377679695,
+        "ote": 0.60368424406878,
+        "tf_filter": "none"
+    },
+    "summary_train": {
+        "trades": 184,
+        "wins": 49,
+        "losses": 89,
+        "closed_no_hit": 46,
+        "win_rate_pct": 35.507246376811594,
+        "net_pnl_dollars": 4119.277920546656,
+        "days_triggered": 158,
+        "flash_trades": 3
+    },
+    "summary_test": {
+        "trades": 73,
+        "wins": 10,
+        "losses": 40,
+        "closed_no_hit": 23,
+        "win_rate_pct": 20.0,
+        "net_pnl_dollars": -741.8409937003355,
+        "days_triggered": 63,
+        "flash_trades": 3
+    }
+}

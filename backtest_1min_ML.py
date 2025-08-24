@@ -6,8 +6,6 @@ from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import optuna
 
 # ---------------------------
@@ -17,6 +15,8 @@ DEFAULT_TZ = "America/New_York"
 LONDON_START, LONDON_END = "03:00", "07:00"
 NY_START, NY_END = "07:00", "12:00"
 RISK_PER_TRADE = 100.0
+# The penalty for a trade that enters and exits on the same candle.
+FLASH_TRADE_PENALTY = 1000
 
 def parse_args():
     p = argparse.ArgumentParser("ICT-style London range -> NY OTE backtest (1m)")
@@ -338,7 +338,7 @@ def backtest_ict_london_bos(df, london_window, ny_window, pivot, sl_mult, tp_mul
 
 def objective(trial, df_train, london_window, ny_window, risk_per_trade):
     params = {
-        "pivot": trial.suggest_int("pivot", 3, 20, step=2),
+        "pivot": trial.suggest_int("pivot", 3, 19, step=2),
         "sl_mult": trial.suggest_float("sl_mult", 0.5, 3.0),
         "tp_mult": trial.suggest_float("tp_mult", 0.5, 5.0),
         "ote": trial.suggest_float("ote", 0.6, 0.8),
@@ -353,8 +353,7 @@ def objective(trial, df_train, london_window, ny_window, risk_per_trade):
         risk_per_trade=risk_per_trade
     )
     
-    # --- Add penalty for flash trades ---
-    penalty = summary["flash_trades"] * 1000  # $1000 penalty per flash trade
+    penalty = summary["flash_trades"] * FLASH_TRADE_PENALTY
     return summary["net_pnl_dollars"] - penalty
 
 def main():
@@ -362,57 +361,39 @@ def main():
     args = parse_args()
     london_window = parse_window(args.london)
     ny_window = parse_window(args.ny)
+
+    # --- Create output directory if it doesn't exist ---
+    os.makedirs(args.outdir, exist_ok=True)
+    study_db_path = f"sqlite:///{os.path.join(args.outdir, 'study.db')}"
+
+    print("Loading data...")
     df = load_mt_csv(args.excel, args.tz)
 
     split_idx = int(len(df) * 0.7)
     df_train = df.iloc[:split_idx]
     df_test = df.iloc[split_idx:]
 
-    study = optuna.create_study(direction="maximize")
+    print(f"Running optimization on {len(df_train)} candles (70% of data)...")
+    study = optuna.create_study(
+        direction="maximize",
+        storage=study_db_path,  # Save study to a file
+        study_name="london-bos-backtest",
+        load_if_exists=True
+    )
     study.optimize(lambda trial: objective(trial, df_train, london_window, ny_window, args.risk), n_trials=200)
 
-    print("\n✅ Best parameters (train):", study.best_params)
-    print("📈 Best train score:", study.best_value)
+    print("\n✅ Optimization complete.")
+    print("📈 Best parameters found:", study.best_params)
+    print("📊 Best profit (adjusted for penalties):", study.best_value)
 
-    # --- Get and re-run top 3 trials for detailed results ---
-    print("\nRe-running top 3 trials to get detailed backtest results...")
-    
-    trials_df = study.trials_dataframe().sort_values("value", ascending=False).head(3)
-    
-    for index, row in trials_df.iterrows():
-        trial_params = {
-            "pivot": row["params_pivot"],
-            "sl_mult": row["params_sl_mult"],
-            "tp_mult": row["params_tp_mult"],
-            "ote": row["params_ote"],
-            "tf_filter": row["params_tf_filter"],
-        }
-        
-        trades_df, summary = backtest_ict_london_bos(
-            df_train,
-            london_window=london_window,
-            ny_window=ny_window,
-            **trial_params,
-            risk_per_trade=args.risk
-        )
-        
-        print(f"\n--- Top {index + 1} Result ---")
-        print(f"Parameters: {trial_params}")
-        if not trades_df.empty:
-            for _, r in trades_df.iterrows():
-                print(f"\n{r['day'].date()} [{r['side'].upper()}]")
-                print(f"  Entry @ {r['entry_time']}  price={r['entry_price']:.3f}")
-                print(f"  Final SL/TP: {r['sl']:.3f} | {r['tp']:.3f}")
-                print(f"  Exit @ {r['exit_time']}  price={r['exit_price']:.3f}  reason={r['exit_reason']}")
-                print(f"  PnL=${r['pnl_dollars']:.2f}  RR={r['rr']:.2f}")
-                print(f"  4h: {r.get('4h_trend', 'NA')}, 1h: {r.get('1h_trend', 'NA')}")
-        else:
-            print("No trades were taken with these parameters.")
-
-        print("\nSummary:", summary)
-
-    # --- Final evaluation on unseen test data ---
-    print("\nEvaluating on unseen test data with best parameters...")
+    # --- Get final results for saving ---
+    trades_train_df, summary_train = backtest_ict_london_bos(
+        df_train,
+        london_window=london_window,
+        ny_window=ny_window,
+        **study.best_params,
+        risk_per_trade=args.risk
+    )
     trades_test_df, summary_test = backtest_ict_london_bos(
         df_test,
         london_window=london_window,
@@ -420,9 +401,37 @@ def main():
         **study.best_params,
         risk_per_trade=args.risk
     )
+
+    # --- Prepare and save results to files ---
+    print("\nSaving detailed results...")
     
-    print("\n📊 Test performance:", summary_test)
-    print("Backtest complete.")
+    results = {
+        "best_parameters": study.best_params,
+        "summary_train": summary_train,
+        "summary_test": summary_test,
+    }
+    
+    # Clean up results dictionary for JSON saving
+    for k, v in results["best_parameters"].items():
+        if isinstance(v, np.float64):
+            results["best_parameters"][k] = float(v)
+
+    # Save to JSON
+    json_path = os.path.join(args.outdir, "results.json")
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=4)
+        
+    # Save trade logs to CSV
+    if not trades_train_df.empty:
+        trades_train_df.to_csv(os.path.join(args.outdir, "trades_train.csv"))
+    if not trades_test_df.empty:
+        trades_test_df.to_csv(os.path.join(args.outdir, "trades_test.csv"))
+        
+    print("\n🚀 All results saved!")
+    print(f"Results summary: {json_path}")
+    print(f"Training trade log: {os.path.join(args.outdir, 'trades_train.csv')}")
+    print(f"Test trade log: {os.path.join(args.outdir, 'trades_test.csv')}")
+    print("\nBacktest complete.")
 
 if __name__=="__main__":
     main()
